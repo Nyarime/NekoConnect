@@ -16,6 +16,9 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os/exec"
+
+	"github.com/songgao/water"
 	"os"
 	"strings"
 	"sync"
@@ -277,12 +280,31 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("TUNNEL: %s → %s (user=%s)", conn.RemoteAddr(), clientIP, sess.Username)
 
-	// CSTP read/write loop
-	go cstpWriter(conn, clientIP)
-	cstpReader(conn, bufRW, clientIP)
+	// Create TUN device for this session
+	tun, err := water.New(water.Config{DeviceType: water.TUN})
+	if err != nil {
+		log.Printf("TUN create failed: %v", err)
+		return
+	}
+	defer tun.Close()
+	tunName := tun.Name()
+
+	// Configure TUN: assign gateway IP, bring up, set MTU
+	gw := ipPool.Gateway()
+	exec.Command("ip", "link", "set", "dev", tunName, "up", "mtu", fmt.Sprintf("%d", cfg.MTU)).Run()
+	exec.Command("ip", "addr", "add", fmt.Sprintf("%s/24", gw.String()), "dev", tunName).Run()
+	exec.Command("ip", "route", "add", clientIP.String()+"/32", "dev", tunName).Run()
+	defer exec.Command("ip", "route", "del", clientIP.String()+"/32", "dev", tunName).Run()
+
+	log.Printf("TUN %s up: gw=%s client=%s mtu=%d", tunName, gw, clientIP, cfg.MTU)
+
+	// CSTP <-> TUN bridge
+	go tunToCstp(tun, conn, clientIP)
+	cstpToTun(conn, bufRW, tun, clientIP)
 }
 
-func cstpReader(conn net.Conn, bufRW *bufio.ReadWriter, clientIP net.IP) {
+// cstpToTun: read CSTP DATA frames from client, write to TUN
+func cstpToTun(conn net.Conn, bufRW *bufio.ReadWriter, tun *water.Interface, clientIP net.IP) {
 	defer conn.Close()
 	buf := make([]byte, 65536)
 
@@ -303,21 +325,16 @@ func cstpReader(conn net.Conn, bufRW *bufio.ReadWriter, clientIP net.IP) {
 		switch pktType {
 		case PktDATA:
 			if int(dataLen)+8 <= n {
-				// TODO: write to TUN device
-				log.Printf("DATA: %d bytes from %s", dataLen, clientIP)
+				// Write IP packet to TUN
+				tun.Write(buf[8 : 8+int(dataLen)])
 			}
 		case PktDPD_REQ:
-			// Send DPD response
 			resp := make([]byte, 8)
 			copy(resp, plHeader)
 			resp[6] = PktDPD_RESP
 			conn.Write(resp)
 		case PktKEEPALIVE:
-			// Echo keepalive
-			resp := make([]byte, 8)
-			copy(resp, plHeader)
-			resp[6] = PktKEEPALIVE
-			conn.Write(resp)
+			// no response needed
 		case PktDISCONNECT:
 			log.Printf("DISCONNECT: %s", clientIP)
 			return
@@ -325,21 +342,33 @@ func cstpReader(conn net.Conn, bufRW *bufio.ReadWriter, clientIP net.IP) {
 	}
 }
 
-func cstpWriter(conn net.Conn, clientIP net.IP) {
-	// TODO: read from TUN device and send to client
-	// For now, just send periodic DPD requests
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
+// tunToCstp: read packets from TUN, send as CSTP DATA frames to client
+func tunToCstp(tun *water.Interface, conn net.Conn, clientIP net.IP) {
+	buf := make([]byte, 65536)
+	frame := make([]byte, 65536)
 
-	for range ticker.C {
-		resp := make([]byte, 8)
-		copy(resp, plHeader)
-		resp[6] = PktDPD_REQ
-		if _, err := conn.Write(resp); err != nil {
+	for {
+		n, err := tun.Read(buf)
+		if err != nil {
+			log.Printf("TUN read error: %v", err)
+			return
+		}
+		if n == 0 {
+			continue
+		}
+
+		// Build CSTP DATA frame
+		copy(frame, plHeader)
+		binary.BigEndian.PutUint16(frame[4:6], uint16(n))
+		frame[6] = PktDATA
+		copy(frame[8:], buf[:n])
+
+		if _, err := conn.Write(frame[:8+n]); err != nil {
 			return
 		}
 	}
 }
+
 
 // IPPool manages VPN client IPs
 type IPPool struct {
@@ -383,3 +412,4 @@ func (p *IPPool) Release(ip net.IP) {
 }
 
 func (p *IPPool) Mask() net.IPMask { return p.network.Mask }
+func (p *IPPool) Gateway() net.IP { return p.gateway }
