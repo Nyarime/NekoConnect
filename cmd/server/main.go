@@ -87,6 +87,17 @@ func setupNAT() {
 	exec.Command("iptables", "-D", "FORWARD", "-d", cfg.Pool, "-j", "ACCEPT").Run()
 	exec.Command("iptables", "-A", "FORWARD", "-d", cfg.Pool, "-j", "ACCEPT").Run()
 	log.Printf("NAT enabled: %s → %s (MASQUERADE)", cfg.Pool, iface)
+	// Start DTLS server on same port
+	if cfg.CertFile != "" && cfg.KeyFile != "" {
+		cert, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
+		if err == nil {
+			dtlsServer = NewDTLSServer(443, cert)
+			if err := dtlsServer.Start(); err != nil {
+				log.Printf("DTLS start: %v (UDP acceleration disabled)", err)
+				dtlsServer = nil
+			}
+		}
+	}
 }
 
 func main() {
@@ -276,6 +287,7 @@ func handleProfile(w http.ResponseWriter, r *http.Request) {
 }
 
 var upstreamProxy *httputil.ReverseProxy
+var dtlsServer *DTLSServer
 
 func initUpstream() {
 	if cfg.Upstream == "" { return }
@@ -470,6 +482,17 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 	resp.WriteString("X-CSTP-Rekey-Method: new-tunnel\r\n")
 	resp.WriteString("X-DTLS-Rekey-Time: 86400\r\n")
 	resp.WriteString("X-CSTP-Split-Include: 10.99.0.0/255.255.255.0\r\n")
+	if dtlsServer != nil && masterSecret != "" {
+		// DTLS headers - must include Session-ID for client to match
+		resp.WriteString(fmt.Sprintf("X-DTLS-Port: %d\r\n", 443))
+		resp.WriteString(fmt.Sprintf("X-DTLS-MTU: %d\r\n", cfg.MTU))
+		resp.WriteString(fmt.Sprintf("X-DTLS-Session-ID: %s\r\n", masterSecret[:64]))
+		resp.WriteString("X-DTLS-DPD: 30\r\n")
+		resp.WriteString("X-DTLS-Keepalive: 20\r\n")
+		resp.WriteString("X-DTLS-Rekey-Time: 86400\r\n")
+		resp.WriteString("X-DTLS-Rekey-Method: new-tunnel\r\n")
+		resp.WriteString("X-DTLS12-CipherSuite: ECDHE-RSA-AES256-GCM-SHA384\r\n")
+	}
 	resp.WriteString("\r\n")
 	conn.Write([]byte(resp.String()))
 
@@ -492,6 +515,10 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 	defer exec.Command("ip", "route", "del", clientIP.String()+"/32", "dev", tunName).Run()
 
 	log.Printf("TUN %s up: gw=%s client=%s mtu=%d", tunName, gw, clientIP, cfg.MTU)
+	if dtlsServer != nil && masterSecret != "" {
+		dtlsServer.RegisterSession(masterSecret, clientIP, tun)
+		defer dtlsServer.UnregisterSession(masterSecret)
+	}
 
 	// CSTP <-> TUN bridge
 	go tunToCstp(tun, conn, clientIP)
