@@ -127,7 +127,12 @@ func main() {
 
 // handlePortal serves the Cisco ASA login page
 func handlePortal(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Server", "Cisco ASA SSL VPN")
+	// removed: w.Header().Set("Server", "Cisco ASA SSL VPN")
+	// POST = AnyConnect auth request (XML)
+	if r.Method == "POST" {
+		handleAuth(w, r)
+		return
+	}
 	w.Header().Set("Content-Type", "text/html")
 	fmt.Fprint(w, `<html><head><title>SSL VPN Service</title></head>
 <body><h2>SSL VPN Service</h2><p>Please use Cisco AnyConnect client to connect.</p></body></html>`)
@@ -138,13 +143,28 @@ func handleAuth(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(io.LimitReader(r.Body, 4096))
 	bodyStr := string(body)
 
-	// Check password in XML body
+	w.Header().Set("Content-Type", "text/xml")
+
+	// First request: no password → send auth form
 	if !strings.Contains(bodyStr, cfg.Password) {
-		w.WriteHeader(401)
 		fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?>
-<config-auth client="vpn" type="auth-request">
-<auth id="main"><message>Authentication failed</message>
-<form><input type="password" name="password" label="Password:"/></form></auth></config-auth>`)
+<config-auth client="vpn" type="auth-request" aggregate-auth-version="2">
+<opaque is-for="sg">
+<tunnel-group>VPN</tunnel-group>
+<group-alias>VPN</group-alias>
+<aggauth-handle>168179266</aggauth-handle>
+<config-hash>1595829378234</config-hash>
+</opaque>
+<auth id="main">
+<title>Login</title>
+<message>Please enter your credentials</message>
+<banner></banner>
+<form>
+<input type="text" name="username" label="Username:"></input>
+<input type="password" name="password" label="Password:"></input>
+</form>
+</auth>
+</config-auth>`)
 		return
 	}
 
@@ -159,9 +179,16 @@ func handleAuth(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "text/xml")
 	fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?>
-<config-auth client="vpn" type="complete">
-<auth id="success"><message>Welcome</message></auth>
-<session-token>%s</session-token></config-auth>`, token)
+<config-auth client="vpn" type="complete" aggregate-auth-version="2">
+<session-token>%s</session-token>
+<auth id="success">
+<banner>Welcome to NekoConnect VPN</banner>
+<message id="0" param1="" param2=""></message>
+</auth>
+<capabilities>
+<crypto-supported>ssl-dhe</crypto-supported>
+</capabilities>
+</config-auth>`, token)
 }
 
 // handleTunnel handles CONNECT /CSCOSSLC/tunnel — the actual VPN tunnel
@@ -194,33 +221,25 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 	masterSecret := r.Header.Get("X-DTLS-Master-Secret")
 	_ = masterSecret // TODO: DTLS channel
 
-	hn, _ := os.Hostname()
-
 	// Send tunnel response headers (AnyConnect protocol)
-	w.Header().Set("Server", "NekoConnect")
-	w.Header().Set("X-CSTP-Version", "1")
-	w.Header().Set("X-CSTP-Server-Name", "NekoConnect")
-	w.Header().Set("X-CSTP-Protocol", "Copyright (c) 2004 Cisco Systems, Inc.")
-	w.Header().Set("X-CSTP-Address", clientIP.String())
-	w.Header().Set("X-CSTP-Netmask", net.IP(ipPool.Mask()).String())
-	w.Header().Set("X-CSTP-Hostname", hn)
-	w.Header().Set("X-CSTP-DNS", cfg.DNS)
-	w.Header().Set("X-CSTP-MTU", fmt.Sprintf("%d", cfg.MTU))
-	w.Header().Set("X-CSTP-DPD", "30")
-	w.Header().Set("X-CSTP-Keepalive", "20")
-	w.Header().Set("X-CSTP-Lease-Duration", "1209600")
-	w.Header().Set("X-CSTP-Session-Timeout", "none")
-	w.Header().Set("X-CSTP-Idle-Timeout", "18000")
-	w.Header().Set("X-CSTP-Disconnected-Timeout", "18000")
-	w.Header().Set("X-CSTP-Keep", "true")
-	w.Header().Set("X-CSTP-Tunnel-All-DNS", "false")
-	w.Header().Set("X-CSTP-Rekey-Time", "86400")
-	w.Header().Set("X-CSTP-Rekey-Method", "new-tunnel")
-	w.Header().Set("X-DTLS-Rekey-Time", "86400")
-	w.Header().Set("X-CSTP-Split-Exclude", "0.0.0.0/255.255.255.255")
-	w.WriteHeader(200)
-
-	// Hijack connection for raw CSTP framing
+	// removed: w.Header().Set("Server", "NekoConnect")
+	// removed: w.Header().Set("X-CSTP-Version", "1")
+	// removed: w.Header().Set("X-CSTP-Server-Name", "NekoConnect")
+	// removed: w.Header().Set("X-CSTP-Protocol", "Copyright (c) 2004 Cisco Systems, Inc.")
+	// removed: w.Header().Set("X-CSTP-Address", clientIP.String())
+	// removed: w.Header().Set("X-CSTP-Netmask", net.IP(ipPool.Mask()).String())
+	// removed: w.Header().Set("X-CSTP-DNS", cfg.DNS)
+	// removed: w.Header().Set("X-CSTP-MTU", fmt.Sprintf("%d", cfg.MTU))
+	// removed: w.Header().Set("X-CSTP-DPD", "30")
+	// removed: w.Header().Set("X-CSTP-Keepalive", "20")
+	// removed: w.Header().Set("X-CSTP-Lease-Duration", "1209600")
+	// removed: w.Header().Set("X-CSTP-Session-Timeout", "none")
+	// removed: w.Header().Set("X-CSTP-Idle-Timeout", "18000")
+	// removed: w.Header().Set("X-CSTP-Disconnected-Timeout", "18000")
+	// removed: w.Header().Set("X-CSTP-Keep", "true")
+	// removed: w.Header().Set("X-CSTP-Tunnel-All-DNS", "false")
+	// removed: w.Header().Set("X-CSTP-Rekey-Time", "86400")
+	// Hijack FIRST, then write raw response (WriteHeader doesn't work well for CONNECT)
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		return
@@ -230,6 +249,31 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.Close()
+
+	// Write raw HTTP 200 + CSTP headers
+	var resp strings.Builder
+	resp.WriteString("HTTP/1.1 200 CONNECTED\r\n")
+	resp.WriteString("Server: NekoConnect\r\n")
+	resp.WriteString("X-CSTP-Version: 1\r\n")
+	resp.WriteString("X-CSTP-Server-Name: NekoConnect\r\n")
+	resp.WriteString(fmt.Sprintf("X-CSTP-Address: %s\r\n", clientIP.String()))
+	resp.WriteString(fmt.Sprintf("X-CSTP-Netmask: %s\r\n", net.IP(ipPool.Mask()).String()))
+	resp.WriteString(fmt.Sprintf("X-CSTP-DNS: %s\r\n", cfg.DNS))
+	resp.WriteString(fmt.Sprintf("X-CSTP-MTU: %d\r\n", cfg.MTU))
+	resp.WriteString("X-CSTP-DPD: 30\r\n")
+	resp.WriteString("X-CSTP-Keepalive: 20\r\n")
+	resp.WriteString("X-CSTP-Lease-Duration: 1209600\r\n")
+	resp.WriteString("X-CSTP-Session-Timeout: none\r\n")
+	resp.WriteString("X-CSTP-Idle-Timeout: 18000\r\n")
+	resp.WriteString("X-CSTP-Disconnected-Timeout: 18000\r\n")
+	resp.WriteString("X-CSTP-Keep: true\r\n")
+	resp.WriteString("X-CSTP-Tunnel-All-DNS: false\r\n")
+	resp.WriteString("X-CSTP-Rekey-Time: 86400\r\n")
+	resp.WriteString("X-CSTP-Rekey-Method: new-tunnel\r\n")
+	resp.WriteString("X-DTLS-Rekey-Time: 86400\r\n")
+	resp.WriteString("X-CSTP-Split-Include: 10.99.0.0/255.255.255.0\r\n")
+	resp.WriteString("\r\n")
+	conn.Write([]byte(resp.String()))
 
 	log.Printf("TUNNEL: %s → %s (user=%s)", conn.RemoteAddr(), clientIP, sess.Username)
 
