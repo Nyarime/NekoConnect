@@ -255,7 +255,7 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 	resp.WriteString("HTTP/1.1 200 CONNECTED\r\n")
 	resp.WriteString("Server: NekoConnect\r\n")
 	resp.WriteString("X-CSTP-Version: 1\r\n")
-	resp.WriteString("X-CSTP-Server-Name: NekoConnect\r\n")
+	resp.WriteString("X-CSTP-Server-Name: vpn2fa.hku.hk\r\n")
 	resp.WriteString(fmt.Sprintf("X-CSTP-Address: %s\r\n", clientIP.String()))
 	resp.WriteString(fmt.Sprintf("X-CSTP-Netmask: %s\r\n", net.IP(ipPool.Mask()).String()))
 	resp.WriteString(fmt.Sprintf("X-CSTP-DNS: %s\r\n", cfg.DNS))
