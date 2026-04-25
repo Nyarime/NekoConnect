@@ -53,7 +53,9 @@ var cfg struct {
 	KeyFile   string
 	AutoCert  string
 	CertCache string
-	Upstream  string
+	Upstream    string
+	OurSNI      string
+	UpstreamTCP string
 }
 
 // Session
@@ -98,7 +100,9 @@ func main() {
 	flag.StringVar(&cfg.KeyFile, "key", "", "TLS key file")
 	flag.StringVar(&cfg.AutoCert, "autocert", "", "Domain for Let's Encrypt auto cert (e.g. vpn.mydomain.com)")
 	flag.StringVar(&cfg.CertCache, "cert-cache", "/var/cache/nekoconnect-certs", "Autocert cache dir")
-	flag.StringVar(&cfg.Upstream, "upstream", "", "Real Cisco ASA to reverse-proxy unauthorized traffic to (e.g. https://vpn2fa.hku.hk)")
+	flag.StringVar(&cfg.Upstream, "upstream", "", "HTTP reverse proxy target for unauthorized requests")
+	flag.StringVar(&cfg.OurSNI, "our-sni", "", "Our SNI domain (TLS-routed to VPN; other SNIs → upstream-tcp)")
+	flag.StringVar(&cfg.UpstreamTCP, "upstream-tcp", "", "Raw TCP forward target for unmatched SNI (e.g. vpn2fa.hku.hk:443)")
 	flag.Parse()
 
 	if cfg.Password == "" {
@@ -143,6 +147,45 @@ func main() {
 		}
 	} else {
 		log.Fatal("Need -autocert <domain>, -cert/-key, or -sni")
+	}
+
+	// SNI router mode: split traffic by SNI
+	if cfg.OurSNI != "" && cfg.UpstreamTCP != "" {
+		rawLn, err := net.Listen("tcp", cfg.Listen)
+		if err != nil { log.Fatal("listen:", err) }
+		log.Printf("SNI router: %q → VPN, others → %s", cfg.OurSNI, cfg.UpstreamTCP)
+
+		mux := http.NewServeMux()
+		mux.HandleFunc("/", handlePortal)
+		mux.HandleFunc("/+CSCOE+/logon.html", handlePortal)
+		mux.HandleFunc("/auth", handleAuth)
+		mux.HandleFunc("/profiles/vpn.xml", handleProfile)
+		mux.HandleFunc("/CACerts/", handleProfile)
+
+		router := &SNIRouter{
+			OurSNIs:     []string{cfg.OurSNI},
+			UpstreamTCP: cfg.UpstreamTCP,
+			TLSConfig:   tlsCfg,
+			HTTPHandler: func(c *tls.Conn) {
+				server := &http.Server{
+					Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						if r.Method == "CONNECT" { handleTunnel(w, r); return }
+						mux.ServeHTTP(w, r)
+					}),
+				}
+				oneShotLn := &oneShotListener{conn: c}
+				server.Serve(oneShotLn)
+			},
+		}
+
+		setupNAT()
+		log.Printf("NekoConnect VPN server on %s (pool=%s, mtu=%d)", cfg.Listen, cfg.Pool, cfg.MTU)
+		for {
+			conn, err := rawLn.Accept()
+			if err != nil { continue }
+			go router.HandleConn(conn)
+		}
+		return
 	}
 
 	ln, err := tls.Listen("tcp", cfg.Listen, tlsCfg)
@@ -521,6 +564,20 @@ func tunToCstp(tun *water.Interface, conn net.Conn, clientIP net.IP) {
 	}
 }
 
+
+// oneShotListener wraps a single conn as a net.Listener for http.Server
+type oneShotListener struct {
+	conn net.Conn
+	done bool
+}
+
+func (l *oneShotListener) Accept() (net.Conn, error) {
+	if l.done { return nil, fmt.Errorf("done") }
+	l.done = true
+	return l.conn, nil
+}
+func (l *oneShotListener) Close() error { return nil }
+func (l *oneShotListener) Addr() net.Addr { return l.conn.LocalAddr() }
 
 // IPPool manages VPN client IPs
 type IPPool struct {
