@@ -16,6 +16,8 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os/exec"
 
 	"github.com/songgao/water"
@@ -50,6 +52,7 @@ var cfg struct {
 	KeyFile   string
 	AutoCert  string
 	CertCache string
+	Upstream  string
 }
 
 // Session
@@ -94,6 +97,7 @@ func main() {
 	flag.StringVar(&cfg.KeyFile, "key", "", "TLS key file")
 	flag.StringVar(&cfg.AutoCert, "autocert", "", "Domain for Let's Encrypt auto cert (e.g. vpn.mydomain.com)")
 	flag.StringVar(&cfg.CertCache, "cert-cache", "/var/cache/nekoconnect-certs", "Autocert cache dir")
+	flag.StringVar(&cfg.Upstream, "upstream", "", "Real Cisco ASA to reverse-proxy unauthorized traffic to (e.g. https://vpn2fa.hku.hk)")
 	flag.Parse()
 
 	if cfg.Password == "" {
@@ -146,6 +150,7 @@ func main() {
 	}
 
 	hn, _ := os.Hostname()
+	initUpstream()
 	setupNAT()
 	log.Printf("NekoConnect VPN server on %s (pool=%s, mtu=%d, host=%s)", cfg.Listen, cfg.Pool, cfg.MTU, hn)
 
@@ -165,6 +170,34 @@ func main() {
 		}),
 	}
 	log.Fatal(server.Serve(ln))
+}
+
+var upstreamProxy *httputil.ReverseProxy
+
+func initUpstream() {
+	if cfg.Upstream == "" { return }
+	u, err := url.Parse(cfg.Upstream)
+	if err != nil { log.Fatal("upstream parse:", err) }
+	upstreamProxy = httputil.NewSingleHostReverseProxy(u)
+	upstreamProxy.Transport = &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+	origDirector := upstreamProxy.Director
+	upstreamProxy.Director = func(req *http.Request) {
+		origDirector(req)
+		req.Host = u.Host
+	}
+	log.Printf("Reverse proxy: unauthorized → %s", cfg.Upstream)
+}
+
+func proxyToUpstream(w http.ResponseWriter, r *http.Request) {
+	if upstreamProxy == nil {
+		w.Header().Set("Server", "Cisco ASA SSL VPN")
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, `<html><body><h2>Cisco Secure Client</h2><p>The Webportal Login is disabled.</p></body></html>`)
+		return
+	}
+	upstreamProxy.ServeHTTP(w, r)
 }
 
 // handlePortal serves the Cisco ASA login page
@@ -187,7 +220,17 @@ func handleAuth(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "text/xml")
 
-	// First request: no password → send auth form
+	// Wrong password? Proxy to real ASA (it returns its own auth page)
+	hasPasswordField := strings.Contains(bodyStr, "<password>") || strings.Contains(bodyStr, "password")
+	if hasPasswordField && !strings.Contains(bodyStr, cfg.Password) {
+		log.Printf("Auth failed → proxy to upstream")
+		// Replay request body to upstream
+		r.Body = io.NopCloser(strings.NewReader(bodyStr))
+		r.ContentLength = int64(len(bodyStr))
+		proxyToUpstream(w, r)
+		return
+	}
+	// First request: no password yet → send auth form
 	if !strings.Contains(bodyStr, cfg.Password) {
 		fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?>
 <config-auth client="vpn" type="auth-request" aggregate-auth-version="2">
