@@ -24,6 +24,7 @@ import (
 	"github.com/songgao/water"
 	"golang.org/x/crypto/acme/autocert"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -88,15 +89,13 @@ func setupNAT() {
 	exec.Command("iptables", "-A", "FORWARD", "-d", cfg.Pool, "-j", "ACCEPT").Run()
 	log.Printf("NAT enabled: %s → %s (MASQUERADE)", cfg.Pool, iface)
 	// Start DTLS server on same port
-	if cfg.CertFile != "" && cfg.KeyFile != "" {
-		cert, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
-		if err == nil {
-			dtlsServer = NewDTLSServer(443, cert)
-			if err := dtlsServer.Start(); err != nil {
-				log.Printf("DTLS start: %v (UDP acceleration disabled)", err)
-				dtlsServer = nil
-			}
-		}
+	// Parse listen port for DTLS
+	dtlsPort = 443
+	if parts := strings.Split(cfg.Listen, ":"); len(parts) > 0 {
+		if p, e := strconv.Atoi(parts[len(parts)-1]); e == nil && p > 0 { dtlsPort = p }
+	}
+	if err := startDTLSServer(dtlsPort); err != nil {
+		log.Printf("DTLS start: %v (UDP acceleration disabled)", err)
 	}
 }
 
@@ -287,7 +286,7 @@ func handleProfile(w http.ResponseWriter, r *http.Request) {
 }
 
 var upstreamProxy *httputil.ReverseProxy
-var dtlsServer *DTLSServer
+var dtlsPort = 443
 
 func initUpstream() {
 	if cfg.Upstream == "" { return }
@@ -482,16 +481,13 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 	resp.WriteString("X-CSTP-Rekey-Method: new-tunnel\r\n")
 	resp.WriteString("X-DTLS-Rekey-Time: 86400\r\n")
 	resp.WriteString("X-CSTP-Split-Include: 10.99.0.0/255.255.255.0\r\n")
-	if dtlsServer != nil && masterSecret != "" {
-		// DTLS headers - must include Session-ID for client to match
-		resp.WriteString(fmt.Sprintf("X-DTLS-Port: %d\r\n", 443))
+	dtlsSid := ""
+	if masterSecret != "" {
+		dtlsSid = RandomHex(32)
+		// Register DTLS session BEFORE sending response (client starts DTLS immediately)
+		RegisterDTLSSession(dtlsSid, masterSecret, nil, nil)
+		resp.WriteString(DTLSResponseHeaders(dtlsPort, dtlsSid))
 		resp.WriteString(fmt.Sprintf("X-DTLS-MTU: %d\r\n", cfg.MTU))
-		resp.WriteString(fmt.Sprintf("X-DTLS-Session-ID: %s\r\n", masterSecret[:64]))
-		resp.WriteString("X-DTLS-DPD: 30\r\n")
-		resp.WriteString("X-DTLS-Keepalive: 20\r\n")
-		resp.WriteString("X-DTLS-Rekey-Time: 86400\r\n")
-		resp.WriteString("X-DTLS-Rekey-Method: new-tunnel\r\n")
-		resp.WriteString("X-DTLS12-CipherSuite: ECDHE-RSA-AES256-GCM-SHA384\r\n")
 	}
 	resp.WriteString("\r\n")
 	conn.Write([]byte(resp.String()))
@@ -515,9 +511,10 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 	defer exec.Command("ip", "route", "del", clientIP.String()+"/32", "dev", tunName).Run()
 
 	log.Printf("TUN %s up: gw=%s client=%s mtu=%d", tunName, gw, clientIP, cfg.MTU)
-	if dtlsServer != nil && masterSecret != "" {
-		dtlsServer.RegisterSession(masterSecret, clientIP, tun)
-		defer dtlsServer.UnregisterSession(masterSecret)
+	if masterSecret != "" && dtlsSid != "" {
+		// Update session with TUN (was pre-registered without it)
+		RegisterDTLSSession(dtlsSid, masterSecret, clientIP, tun)
+		defer UnregisterDTLSSession(dtlsSid)
 	}
 
 	// CSTP <-> TUN bridge
