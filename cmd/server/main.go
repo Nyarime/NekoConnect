@@ -55,6 +55,7 @@ var cfg struct {
 	AutoCert  string
 	CertCache string
 	Upstream    string
+	UsersFile   string
 	OurSNI      string
 	UpstreamTCP string
 }
@@ -102,7 +103,8 @@ func setupNAT() {
 func main() {
 	flag.StringVar(&cfg.Listen, "listen", ":443", "Listen address")
 	flag.StringVar(&cfg.SNI, "sni", "", "SNI for Reality (empty = use cert/key)")
-	flag.StringVar(&cfg.Password, "password", "", "Auth password (required)")
+	flag.StringVar(&cfg.Password, "password", "", "Auth password (single-password mode)")
+	flag.StringVar(&cfg.UsersFile, "users", "", "Users config file (JSON, multi-user mode)")
 	flag.StringVar(&cfg.Pool, "pool", "10.10.0.0/24", "VPN IP pool")
 	flag.StringVar(&cfg.DNS, "dns", "8.8.8.8", "DNS to push")
 	flag.IntVar(&cfg.MTU, "mtu", 1399, "Tunnel MTU")
@@ -115,8 +117,8 @@ func main() {
 	flag.StringVar(&cfg.UpstreamTCP, "upstream-tcp", "", "Raw TCP forward target for unmatched SNI (e.g. vpn2fa.hku.hk:443)")
 	flag.Parse()
 
-	if cfg.Password == "" {
-		log.Fatal("-password required")
+	if cfg.Password == "" && cfg.UsersFile == "" {
+		log.Fatal("-password or -users required")
 	}
 
 	var err error
@@ -205,6 +207,11 @@ func main() {
 
 	hn, _ := os.Hostname()
 	initUpstream()
+	if cfg.UsersFile != "" {
+		if err := loadUsers(cfg.UsersFile); err != nil {
+			log.Fatal("load users:", err)
+		}
+	}
 	setupNAT()
 	log.Printf("NekoConnect VPN server on %s (pool=%s, mtu=%d, host=%s)", cfg.Listen, cfg.Pool, cfg.MTU, hn)
 
@@ -289,6 +296,11 @@ var upstreamProxy *httputil.ReverseProxy
 var dtlsPort = 443
 
 func initUpstream() {
+	if cfg.UsersFile != "" {
+		if err := loadUsers(cfg.UsersFile); err != nil {
+			log.Fatal("load users:", err)
+		}
+	}
 	if cfg.Upstream == "" { return }
 	u, err := url.Parse(cfg.Upstream)
 	if err != nil { log.Fatal("upstream parse:", err) }

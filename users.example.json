@@ -1,0 +1,19 @@
+{
+  "groups": {
+    "default": {
+      "routes": ["10.99.0.0/24"],
+      "dns": "8.8.8.8",
+      "banner": "Welcome to NekoConnect VPN"
+    },
+    "admin": {
+      "routes": ["0.0.0.0/0"],
+      "dns": "1.1.1.1",
+      "banner": "Admin access granted"
+    }
+  },
+  "users": {
+    "alice": { "password": "alice123", "group": "admin" },
+    "bob":   { "password": "bob456", "group": "default" },
+    "disabled_user": { "password": "xxx", "group": "default", "disabled": true }
+  }
+}
