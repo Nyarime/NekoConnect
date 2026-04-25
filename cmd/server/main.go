@@ -7,6 +7,7 @@ package main
 import (
 	"bufio"
 	"crypto/rand"
+	"crypto/sha1"
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/hex"
@@ -158,6 +159,8 @@ func main() {
 	mux.HandleFunc("/", handlePortal)
 	mux.HandleFunc("/+CSCOE+/logon.html", handlePortal)
 	mux.HandleFunc("/auth", handleAuth)
+	mux.HandleFunc("/profiles/vpn.xml", handleProfile)
+	mux.HandleFunc("/CACerts/", handleProfile) // some clients fetch here
 
 	// Use custom server to handle both HTTP and CONNECT
 	server := &http.Server{
@@ -170,6 +173,63 @@ func main() {
 		}),
 	}
 	log.Fatal(server.Serve(ln))
+}
+
+
+// vpnProfileXML is the AnyConnect Profile that gets pushed to clients
+const vpnProfileXML = `<?xml version="1.0" encoding="UTF-8"?>
+<AnyConnectProfile xmlns="http://schemas.xmlsoap.org/encoding/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://schemas.xmlsoap.org/encoding/ AnyConnectProfile.xsd">
+<ClientInitialization>
+<UseStartBeforeLogon UserControllable="true">false</UseStartBeforeLogon>
+<AutomaticCertSelection UserControllable="true">true</AutomaticCertSelection>
+<ShowPreConnectMessage>false</ShowPreConnectMessage>
+<CertificateStore>All</CertificateStore>
+<CertificateStoreOverride>false</CertificateStoreOverride>
+<ProxySettings>Native</ProxySettings>
+<AllowLocalProxyConnections>false</AllowLocalProxyConnections>
+<AuthenticationTimeout>30</AuthenticationTimeout>
+<AutoConnectOnStart UserControllable="true">false</AutoConnectOnStart>
+<MinimizeOnConnect UserControllable="true">true</MinimizeOnConnect>
+<LocalLanAccess UserControllable="true">false</LocalLanAccess>
+<DisableCaptivePortalDetection UserControllable="true">false</DisableCaptivePortalDetection>
+<ClearSmartcardPin UserControllable="true">true</ClearSmartcardPin>
+<IPProtocolSupport>IPv4,IPv6</IPProtocolSupport>
+<AutoReconnect UserControllable="false">true
+<AutoReconnectBehavior UserControllable="false">DisconnectOnSuspend</AutoReconnectBehavior>
+</AutoReconnect>
+<AutoUpdate UserControllable="false">false</AutoUpdate>
+<RSASecurIDIntegration UserControllable="false">Automatic</RSASecurIDIntegration>
+<WindowsLogonEnforcement>SingleLocalLogon</WindowsLogonEnforcement>
+<WindowsVPNEstablishment>LocalUsersOnly</WindowsVPNEstablishment>
+<AutomaticVPNPolicy>false</AutomaticVPNPolicy>
+<PPPExclusion UserControllable="false">Disable
+<PPPExclusionServerIP UserControllable="false"></PPPExclusionServerIP>
+</PPPExclusion>
+<EnableScripting UserControllable="false">false</EnableScripting>
+<EnableAutomaticServerSelection UserControllable="false">false
+<AutoServerSelectionImprovement>20</AutoServerSelectionImprovement>
+<AutoServerSelectionSuspendTime>4</AutoServerSelectionSuspendTime>
+</EnableAutomaticServerSelection>
+<RetainVpnOnLogoff>false</RetainVpnOnLogoff>
+</ClientInitialization>
+<ServerList>
+<HostEntry>
+<HostName>NekoConnect VPN</HostName>
+<HostAddress>vpn2fa.hku.hk</HostAddress>
+</HostEntry>
+</ServerList>
+</AnyConnectProfile>`
+
+// vpnProfileSHA1 returns sha1 hex of the profile
+func vpnProfileSHA1() string {
+	h := sha1.Sum([]byte(vpnProfileXML))
+	return fmt.Sprintf("%x", h)
+}
+
+// handleProfile serves the VPN profile XML to AnyConnect clients
+func handleProfile(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/xml")
+	w.Write([]byte(vpnProfileXML))
 }
 
 var upstreamProxy *httputil.ReverseProxy
@@ -273,7 +333,17 @@ func handleAuth(w http.ResponseWriter, r *http.Request) {
 <capabilities>
 <crypto-supported>ssl-dhe</crypto-supported>
 </capabilities>
-</config-auth>`, token)
+<config client="vpn" type="private">
+<vpn-profile-manifest>
+<vpn rev="1.0">
+<file type="profile" service-type="user">
+<uri>/profiles/vpn.xml</uri>
+<hash type="sha1">%s</hash>
+</file>
+</vpn>
+</vpn-profile-manifest>
+</config>
+</config-auth>`, token, vpnProfileSHA1())
 }
 
 // handleTunnel handles CONNECT /CSCOSSLC/tunnel — the actual VPN tunnel
