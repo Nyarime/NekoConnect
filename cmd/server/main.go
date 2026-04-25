@@ -126,11 +126,16 @@ func main() {
 		}
 		tlsCfg.Certificates = []tls.Certificate{cert}
 	} else if cfg.SNI != "" {
-		// Reality mode: steal cert from SNI target
-		// TODO: integrate NekoPass-Core Reality
-		log.Printf("Reality mode: SNI=%s (needs NekoPass-Core integration)", cfg.SNI)
-		// For now, generate self-signed
-		log.Fatal("Reality mode not yet implemented. Use -cert/-key instead.")
+		// Reality mode: fetch remote cert for fingerprint matching
+		remoteCert, err := FetchRemoteCert(cfg.SNI)
+		if err != nil {
+			log.Fatal("Reality fetch:", err)
+		}
+		_, err = MirrorCertConfig(remoteCert)
+		if err != nil {
+			log.Printf("Reality limitation: %v", err)
+			log.Fatal("Use -autocert <domain> for production deployments")
+		}
 	} else {
 		log.Fatal("Need -autocert <domain>, -cert/-key, or -sni")
 	}
