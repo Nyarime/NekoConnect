@@ -19,6 +19,7 @@ import (
 	"os/exec"
 
 	"github.com/songgao/water"
+	"golang.org/x/crypto/acme/autocert"
 	"os"
 	"strings"
 	"sync"
@@ -45,8 +46,10 @@ var cfg struct {
 	Pool     string
 	DNS      string
 	MTU      int
-	CertFile string
-	KeyFile  string
+	CertFile  string
+	KeyFile   string
+	AutoCert  string
+	CertCache string
 }
 
 // Session
@@ -63,6 +66,23 @@ var (
 	ipPool     *IPPool
 )
 
+// setupNAT enables IP forwarding + NAT MASQUERADE for VPN clients
+func setupNAT() {
+	exec.Command("sysctl", "-w", "net.ipv4.ip_forward=1").Run()
+	// Find primary interface
+	out, _ := exec.Command("sh", "-c", "ip route | grep default | awk '{print $5}' | head -1").Output()
+	iface := strings.TrimSpace(string(out))
+	if iface == "" { iface = "eth0" }
+	// Add MASQUERADE rule (idempotent)
+	exec.Command("iptables", "-t", "nat", "-D", "POSTROUTING", "-s", cfg.Pool, "-o", iface, "-j", "MASQUERADE").Run()
+	exec.Command("iptables", "-t", "nat", "-A", "POSTROUTING", "-s", cfg.Pool, "-o", iface, "-j", "MASQUERADE").Run()
+	exec.Command("iptables", "-D", "FORWARD", "-s", cfg.Pool, "-j", "ACCEPT").Run()
+	exec.Command("iptables", "-A", "FORWARD", "-s", cfg.Pool, "-j", "ACCEPT").Run()
+	exec.Command("iptables", "-D", "FORWARD", "-d", cfg.Pool, "-j", "ACCEPT").Run()
+	exec.Command("iptables", "-A", "FORWARD", "-d", cfg.Pool, "-j", "ACCEPT").Run()
+	log.Printf("NAT enabled: %s → %s (MASQUERADE)", cfg.Pool, iface)
+}
+
 func main() {
 	flag.StringVar(&cfg.Listen, "listen", ":443", "Listen address")
 	flag.StringVar(&cfg.SNI, "sni", "", "SNI for Reality (empty = use cert/key)")
@@ -72,6 +92,8 @@ func main() {
 	flag.IntVar(&cfg.MTU, "mtu", 1399, "Tunnel MTU")
 	flag.StringVar(&cfg.CertFile, "cert", "", "TLS cert file")
 	flag.StringVar(&cfg.KeyFile, "key", "", "TLS key file")
+	flag.StringVar(&cfg.AutoCert, "autocert", "", "Domain for Let's Encrypt auto cert (e.g. vpn.mydomain.com)")
+	flag.StringVar(&cfg.CertCache, "cert-cache", "/var/cache/nekoconnect-certs", "Autocert cache dir")
 	flag.Parse()
 
 	if cfg.Password == "" {
@@ -86,7 +108,18 @@ func main() {
 
 	// TLS config
 	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
-	if cfg.CertFile != "" && cfg.KeyFile != "" {
+	if cfg.AutoCert != "" {
+		// Let's Encrypt automatic cert
+		m := &autocert.Manager{
+			Cache:      autocert.DirCache(cfg.CertCache),
+			Prompt:     autocert.AcceptTOS,
+			HostPolicy: autocert.HostWhitelist(cfg.AutoCert),
+		}
+		tlsCfg.GetCertificate = m.GetCertificate
+		// Start HTTP-01 challenge listener on :80
+		go http.ListenAndServe(":80", m.HTTPHandler(nil))
+		log.Printf("AutoCert enabled for %s (HTTP-01 on :80)", cfg.AutoCert)
+	} else if cfg.CertFile != "" && cfg.KeyFile != "" {
 		cert, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
 		if err != nil {
 			log.Fatal("cert:", err)
@@ -99,7 +132,7 @@ func main() {
 		// For now, generate self-signed
 		log.Fatal("Reality mode not yet implemented. Use -cert/-key instead.")
 	} else {
-		log.Fatal("Need -cert/-key or -sni")
+		log.Fatal("Need -autocert <domain>, -cert/-key, or -sni")
 	}
 
 	ln, err := tls.Listen("tcp", cfg.Listen, tlsCfg)
@@ -108,6 +141,7 @@ func main() {
 	}
 
 	hn, _ := os.Hostname()
+	setupNAT()
 	log.Printf("NekoConnect VPN server on %s (pool=%s, mtu=%d, host=%s)", cfg.Listen, cfg.Pool, cfg.MTU, hn)
 
 	mux := http.NewServeMux()
