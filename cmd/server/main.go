@@ -62,6 +62,8 @@ var cfg struct {
 	AdminToken  string
 	OAuthFile   string
 	DBFile      string
+	BypassCN    bool
+	CNCache     string
 	OurSNI      string
 	UpstreamTCP string
 }
@@ -120,6 +122,8 @@ func main() {
 	flag.StringVar(&cfg.AdminToken, "admin-token", "", "Admin API bearer token")
 	flag.StringVar(&cfg.OAuthFile, "oauth", "", "OAuth/OIDC config file (JSON)")
 	flag.StringVar(&cfg.DBFile, "db", "", "SQLite database file (enables DB mode)")
+	flag.BoolVar(&cfg.BypassCN, "bypass-cn", false, "Exclude CN IPs from VPN (global)")
+	flag.StringVar(&cfg.CNCache, "cn-cache", "/tmp/chnroutes.txt", "CN routes cache file")
 	flag.StringVar(&cfg.Pool, "pool", "10.10.0.0/24", "VPN IP pool")
 	flag.StringVar(&cfg.DNS, "dns", "8.8.8.8", "DNS to push")
 	flag.IntVar(&cfg.MTU, "mtu", 1399, "Tunnel MTU")
@@ -347,6 +351,14 @@ func initUpstream() {
 	if cfg.UsersFile != "" {
 		if err := loadUsers(cfg.UsersFile); err != nil {
 			log.Fatal("load users:", err)
+		}
+	}
+	if cfg.BypassCN {
+		if err := loadCNRoutes(cfg.CNCache); err != nil {
+			log.Printf("CN routes: %v (bypass_cn disabled)", err)
+			cfg.BypassCN = false
+		} else {
+			startCNRoutesRefresh(cfg.CNCache)
 		}
 	}
 	if cfg.Upstream == "" { return }
@@ -611,6 +623,14 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 	resp.WriteString("X-DTLS-Rekey-Time: 86400\r\n")
 	for _, route := range groupRoutes {
 		resp.WriteString(fmt.Sprintf("X-CSTP-Split-Include: %s\r\n", cidrToMask(route)))
+	}
+	// CN IP bypass: only if group has bypass_cn enabled
+	bypassCN := false
+	if sess.Group != nil && sess.Group.BypassCN {
+		bypassCN = true
+	}
+	if bypassCN {
+		resp.WriteString(getCNExcludeHeaders())
 	}
 	dtlsSid := ""
 	if masterSecret != "" {

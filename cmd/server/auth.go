@@ -31,6 +31,7 @@ type GroupConfig struct {
 	DNS       string   `json:"dns"`       // DNS to push
 	Banner    string   `json:"banner"`    // login banner
 	MaxOnline int      `json:"maxOnline"` // max concurrent sessions (0=unlimited)
+	BypassCN  bool     `json:"bypass_cn"`  // exclude CN IPs from VPN
 }
 
 type UserEntry struct {
