@@ -61,6 +61,7 @@ var cfg struct {
 	AdminAddr   string
 	AdminToken  string
 	OAuthFile   string
+	DBFile      string
 	OurSNI      string
 	UpstreamTCP string
 }
@@ -81,7 +82,9 @@ var (
 
 // setupNAT enables IP forwarding + NAT MASQUERADE for VPN clients
 func setupNAT() {
-	startAdminAPI(cfg.AdminAddr, cfg.AdminToken)
+	writePid()
+	defer removePid()
+	
 	exec.Command("sysctl", "-w", "net.ipv4.ip_forward=1").Run()
 	// Find primary interface
 	out, _ := exec.Command("sh", "-c", "ip route | grep default | awk '{print $5}' | head -1").Output()
@@ -107,6 +110,7 @@ func setupNAT() {
 }
 
 func main() {
+	if handleSubcommand() { return }
 	flag.StringVar(&cfg.Listen, "listen", ":443", "Listen address")
 	flag.StringVar(&cfg.SNI, "sni", "", "SNI for Reality (empty = use cert/key)")
 	flag.StringVar(&cfg.Password, "password", "", "Auth password (single-password mode)")
@@ -114,6 +118,7 @@ func main() {
 	flag.StringVar(&cfg.AdminAddr, "admin", "", "Admin API listen address (e.g. 127.0.0.1:9091)")
 	flag.StringVar(&cfg.AdminToken, "admin-token", "", "Admin API bearer token")
 	flag.StringVar(&cfg.OAuthFile, "oauth", "", "OAuth/OIDC config file (JSON)")
+	flag.StringVar(&cfg.DBFile, "db", "", "SQLite database file (enables DB mode)")
 	flag.StringVar(&cfg.Pool, "pool", "10.10.0.0/24", "VPN IP pool")
 	flag.StringVar(&cfg.DNS, "dns", "8.8.8.8", "DNS to push")
 	flag.IntVar(&cfg.MTU, "mtu", 1399, "Tunnel MTU")
@@ -184,8 +189,6 @@ func main() {
 		mux.HandleFunc("/CACerts/", handleProfile)
 		mux.HandleFunc("/sso/callback", handleOAuthCallback)
 		mux.HandleFunc("/sso/wait", handleSSOWait)
-	mux.HandleFunc("/sso/callback", handleOAuthCallback)
-	mux.HandleFunc("/sso/wait", handleSSOWait)
 
 		router := &SNIRouter{
 			OurSNIs:     []string{cfg.OurSNI},
@@ -203,8 +206,10 @@ func main() {
 			},
 		}
 
-		setupNAT()
-	startAdminAPI(cfg.AdminAddr, cfg.AdminToken)
+		writePid()
+	defer removePid()
+	setupNAT()
+	
 		log.Printf("NekoConnect VPN server on %s (pool=%s, mtu=%d)", cfg.Listen, cfg.Pool, cfg.MTU)
 		for {
 			conn, err := rawLn.Accept()
@@ -220,19 +225,9 @@ func main() {
 	}
 
 	hn, _ := os.Hostname()
-	if cfg.OAuthFile != "" {
-		data, err := os.ReadFile(cfg.OAuthFile)
-		if err != nil { log.Fatal("oauth config:", err) }
-		var oc OAuthConfig
-		if err := json.Unmarshal(data, &oc); err != nil { log.Fatal("oauth parse:", err) }
-		initOAuth(&oc)
-	}
 	initUpstream()
-	if cfg.UsersFile != "" {
-		if err := loadUsers(cfg.UsersFile); err != nil {
-			log.Fatal("load users:", err)
-		}
-	}
+	writePid()
+	defer removePid()
 	setupNAT()
 	startAdminAPI(cfg.AdminAddr, cfg.AdminToken)
 	log.Printf("NekoConnect VPN server on %s (pool=%s, mtu=%d, host=%s)", cfg.Listen, cfg.Pool, cfg.MTU, hn)
@@ -243,10 +238,8 @@ func main() {
 	mux.HandleFunc("/auth", handleAuth)
 	mux.HandleFunc("/profiles/vpn.xml", handleProfile)
 	mux.HandleFunc("/CACerts/", handleProfile)
-		mux.HandleFunc("/sso/callback", handleOAuthCallback)
-		mux.HandleFunc("/sso/wait", handleSSOWait)
 	mux.HandleFunc("/sso/callback", handleOAuthCallback)
-	mux.HandleFunc("/sso/wait", handleSSOWait) // some clients fetch here
+	mux.HandleFunc("/sso/wait", handleSSOWait)
 
 	// Use custom server to handle both HTTP and CONNECT
 	server := &http.Server{
@@ -318,6 +311,12 @@ func handleProfile(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(vpnProfileXML))
 }
 
+var (
+	appVersion   = "dev"
+	appCommit    = "unknown"
+	appBuildDate = "unknown"
+)
+
 var upstreamProxy *httputil.ReverseProxy
 var dtlsPort = 443
 type ConfigAuthResponse struct {
@@ -332,6 +331,11 @@ type AuthPayload struct {
 var tokenUserMap sync.Map // session-token → username
 
 func initUpstream() {
+	if cfg.DBFile != "" {
+		if err := initDB(cfg.DBFile); err != nil {
+			log.Fatal("database:", err)
+		}
+	}
 	if cfg.OAuthFile != "" {
 		data, err := os.ReadFile(cfg.OAuthFile)
 		if err != nil { log.Fatal("oauth config:", err) }

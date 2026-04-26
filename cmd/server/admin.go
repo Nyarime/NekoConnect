@@ -167,6 +167,7 @@ func AuditLog(username, action, remoteIP, detail string) {
 		auditLog = auditLog[len(auditLog)-maxAuditEntries:]
 	}
 	log.Printf("AUDIT: user=%s action=%s ip=%s %s", username, action, remoteIP, detail)
+	dbAuditLog(username, action, remoteIP, detail)
 }
 
 // Admin HTTP server
@@ -250,6 +251,38 @@ func startAdminAPI(addr, token string) {
 		key := r.URL.Query().Get("key")
 		loginLock.Unlock(key)
 		json.NewEncoder(w).Encode(map[string]string{"status": "unlocked", "key": key})
+	}))
+
+	// GET /api/users — list users (DB mode)
+	mux.HandleFunc("/api/users", auth(func(w http.ResponseWriter, r *http.Request) {
+		if db == nil {
+			http.Error(w, `{"error":"no database"}`, 400)
+			return
+		}
+		switch r.Method {
+		case "GET":
+			users, err := dbListUsers()
+			if err != nil { http.Error(w, err.Error(), 500); return }
+			json.NewEncoder(w).Encode(users)
+		case "POST":
+			var u struct{ Username, Password, Group string }
+			json.NewDecoder(r.Body).Decode(&u)
+			if err := dbAddUser(u.Username, u.Password, u.Group); err != nil {
+				http.Error(w, err.Error(), 500); return
+			}
+			json.NewEncoder(w).Encode(map[string]string{"status": "created", "username": u.Username})
+		case "DELETE":
+			u := r.URL.Query().Get("username")
+			dbDelUser(u)
+			json.NewEncoder(w).Encode(map[string]string{"status": "deleted", "username": u})
+		}
+	}))
+
+	// GET /api/audit/db — audit from database
+	mux.HandleFunc("/api/audit/db", auth(func(w http.ResponseWriter, r *http.Request) {
+		if db == nil { http.Error(w, `{"error":"no database"}`, 400); return }
+		entries, _ := dbGetAuditLog(100)
+		json.NewEncoder(w).Encode(entries)
 	}))
 
 	// POST /api/reload — reload users.json

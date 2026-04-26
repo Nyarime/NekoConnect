@@ -73,6 +73,11 @@ type AuthResult struct {
 // authenticateUser checks username/password against config
 // Falls back to single-password mode if no users.json loaded
 func authenticateUser(username, password string) AuthResult {
+	// Try DB first
+	if db != nil {
+		return dbAuthenticateUser(username, password)
+	}
+
 	userConfigMu.RLock()
 	uc := userConfig
 	userConfigMu.RUnlock()
