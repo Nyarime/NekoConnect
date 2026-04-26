@@ -11,6 +11,7 @@ import (
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/xml"
 	"flag"
 	"fmt"
@@ -59,6 +60,7 @@ var cfg struct {
 	UsersFile   string
 	AdminAddr   string
 	AdminToken  string
+	OAuthFile   string
 	OurSNI      string
 	UpstreamTCP string
 }
@@ -111,6 +113,7 @@ func main() {
 	flag.StringVar(&cfg.UsersFile, "users", "", "Users config file (JSON, multi-user mode)")
 	flag.StringVar(&cfg.AdminAddr, "admin", "", "Admin API listen address (e.g. 127.0.0.1:9091)")
 	flag.StringVar(&cfg.AdminToken, "admin-token", "", "Admin API bearer token")
+	flag.StringVar(&cfg.OAuthFile, "oauth", "", "OAuth/OIDC config file (JSON)")
 	flag.StringVar(&cfg.Pool, "pool", "10.10.0.0/24", "VPN IP pool")
 	flag.StringVar(&cfg.DNS, "dns", "8.8.8.8", "DNS to push")
 	flag.IntVar(&cfg.MTU, "mtu", 1399, "Tunnel MTU")
@@ -179,6 +182,10 @@ func main() {
 		mux.HandleFunc("/auth", handleAuth)
 		mux.HandleFunc("/profiles/vpn.xml", handleProfile)
 		mux.HandleFunc("/CACerts/", handleProfile)
+		mux.HandleFunc("/sso/callback", handleOAuthCallback)
+		mux.HandleFunc("/sso/wait", handleSSOWait)
+	mux.HandleFunc("/sso/callback", handleOAuthCallback)
+	mux.HandleFunc("/sso/wait", handleSSOWait)
 
 		router := &SNIRouter{
 			OurSNIs:     []string{cfg.OurSNI},
@@ -213,6 +220,13 @@ func main() {
 	}
 
 	hn, _ := os.Hostname()
+	if cfg.OAuthFile != "" {
+		data, err := os.ReadFile(cfg.OAuthFile)
+		if err != nil { log.Fatal("oauth config:", err) }
+		var oc OAuthConfig
+		if err := json.Unmarshal(data, &oc); err != nil { log.Fatal("oauth parse:", err) }
+		initOAuth(&oc)
+	}
 	initUpstream()
 	if cfg.UsersFile != "" {
 		if err := loadUsers(cfg.UsersFile); err != nil {
@@ -228,7 +242,11 @@ func main() {
 	mux.HandleFunc("/+CSCOE+/logon.html", handlePortal)
 	mux.HandleFunc("/auth", handleAuth)
 	mux.HandleFunc("/profiles/vpn.xml", handleProfile)
-	mux.HandleFunc("/CACerts/", handleProfile) // some clients fetch here
+	mux.HandleFunc("/CACerts/", handleProfile)
+		mux.HandleFunc("/sso/callback", handleOAuthCallback)
+		mux.HandleFunc("/sso/wait", handleSSOWait)
+	mux.HandleFunc("/sso/callback", handleOAuthCallback)
+	mux.HandleFunc("/sso/wait", handleSSOWait) // some clients fetch here
 
 	// Use custom server to handle both HTTP and CONNECT
 	server := &http.Server{
@@ -314,6 +332,13 @@ type AuthPayload struct {
 var tokenUserMap sync.Map // session-token → username
 
 func initUpstream() {
+	if cfg.OAuthFile != "" {
+		data, err := os.ReadFile(cfg.OAuthFile)
+		if err != nil { log.Fatal("oauth config:", err) }
+		var oc OAuthConfig
+		if err := json.Unmarshal(data, &oc); err != nil { log.Fatal("oauth parse:", err) }
+		initOAuth(&oc)
+	}
 	if cfg.UsersFile != "" {
 		if err := loadUsers(cfg.UsersFile); err != nil {
 			log.Fatal("load users:", err)
@@ -374,6 +399,16 @@ func handleAuth(w http.ResponseWriter, r *http.Request) {
 	if cr.Auth != nil {
 		username = cr.Auth.Username
 		password = cr.Auth.Password
+	}
+
+	// If OAuth enabled and client supports SSO, offer it
+	if password == "" && oauthCfg != nil {
+		ssoResponse := handleOAuthStart(w, r)
+		if ssoResponse != "" {
+			w.Header().Set("Content-Type", "text/xml")
+			fmt.Fprint(w, ssoResponse)
+			return
+		}
 	}
 
 	// No password yet → send auth form

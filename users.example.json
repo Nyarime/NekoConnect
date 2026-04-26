@@ -12,7 +12,7 @@
     }
   },
   "users": {
-    "alice": { "password": "alice123", "group": "admin" },
+    "alice": { "password": "alice123", "group": "admin", "otp_secret": "JBSWY3DPEHPK3PXP" },
     "bob":   { "password": "bob456", "group": "default" },
     "disabled_user": { "password": "xxx", "group": "default", "disabled": true }
   }

@@ -63,9 +63,11 @@ func loadUsers(path string) error {
 
 // AuthResult contains the result of user authentication
 type AuthResult struct {
-	OK       bool
-	Username string
-	Group    *GroupConfig
+	OK        bool
+	Username  string
+	Group     *GroupConfig
+	NeedOTP   bool   // requires second factor
+	OTPSecret string // for verification
 }
 
 // authenticateUser checks username/password against config
@@ -99,7 +101,7 @@ func authenticateUser(username, password string) AuthResult {
 		group = &GroupConfig{Routes: []string{cfg.Pool}, DNS: cfg.DNS}
 	}
 
-	return AuthResult{OK: true, Username: username, Group: group}
+	return AuthResult{OK: true, Username: username, Group: group, NeedOTP: user.OTPSecret != "", OTPSecret: user.OTPSecret}
 }
 
 // getGroupNames returns available group names for the login form

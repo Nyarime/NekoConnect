@@ -1,0 +1,12 @@
+{
+  "enabled": true,
+  "provider": "google",
+  "clientId": "YOUR_CLIENT_ID.apps.googleusercontent.com",
+  "clientSecret": "YOUR_CLIENT_SECRET",
+  "authUrl": "https://accounts.google.com/o/oauth2/v2/auth",
+  "tokenUrl": "https://oauth2.googleapis.com/token",
+  "userInfoUrl": "https://www.googleapis.com/oauth2/v3/userinfo",
+  "redirectUrl": "https://vpn.example.com/sso/callback",
+  "scopes": "openid email profile",
+  "allowDomains": "example.com,company.com"
+}
