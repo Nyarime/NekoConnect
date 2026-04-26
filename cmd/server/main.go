@@ -64,6 +64,7 @@ var cfg struct {
 	DBFile      string
 	BypassCNMode string
 	CNCache     string
+	CNLevel     int
 	OurSNI      string
 	UpstreamTCP string
 }
@@ -124,6 +125,7 @@ func main() {
 	flag.StringVar(&cfg.DBFile, "db", "", "SQLite database file (enables DB mode)")
 	flag.StringVar(&cfg.BypassCNMode, "bypass-cn", "", "CN bypass mode: exclude or include")
 	flag.StringVar(&cfg.CNCache, "cn-cache", "/tmp/chnroutes.txt", "CN routes cache file")
+	flag.IntVar(&cfg.CNLevel, "cn-level", 20, "CN route aggregation (24=exact/3912, 20=~2500, 18=~1800, 16=~1200)")
 	flag.StringVar(&cfg.Pool, "pool", "10.10.0.0/24", "VPN IP pool")
 	flag.StringVar(&cfg.DNS, "dns", "8.8.8.8", "DNS to push")
 	flag.IntVar(&cfg.MTU, "mtu", 1399, "Tunnel MTU")
@@ -357,6 +359,11 @@ func initUpstream() {
 		if err := loadCNRoutes(cfg.CNCache); err != nil {
 			log.Printf("CN routes: %v (bypass_cn disabled)", err)
 			cfg.BypassCNMode = ""
+		} else if cfg.CNLevel > 0 && cfg.CNLevel < 24 {
+			cnRoutesMu.Lock()
+			cnRoutes = aggregateRoutes(cnRoutes, cfg.CNLevel)
+			cnRoutesMu.Unlock()
+			invertCNRoutes() // re-invert with aggregated routes
 		} else {
 			startCNRoutesRefresh(cfg.CNCache)
 		}

@@ -229,3 +229,141 @@ func rangeToList(start, end uint32) []string {
 	}
 	return result
 }
+
+// aggregateCIDR merges small CN blocks into supernets for fewer routes
+// minPrefix: /24=exact, /20=~2500 routes, /18=~1800 routes, /16=~1200 routes
+func aggregateCIDR(routes []string, minPrefix int) []string {
+	if minPrefix >= 24 || minPrefix <= 0 {
+		return routes // no aggregation
+	}
+
+	type ipnet struct{ ip, mask uint32 }
+	var nets []ipnet
+	for _, cidr := range routes {
+		parts := strings.SplitN(cidr, "/", 2)
+		if len(parts) != 2 { continue }
+		ip := parseIPv4(parts[0])
+		if ip == 0 && parts[0] != "0.0.0.0" { continue }
+		bits := 0
+		fmt.Sscanf(parts[1], "%d", &bits)
+		if bits <= 0 || bits > 32 { continue }
+		mask := uint32(0xFFFFFFFF) << uint32(32-bits)
+		nets = append(nets, ipnet{ip & mask, mask})
+	}
+
+	// Expand each to supernet at minPrefix
+	seen := make(map[uint32]bool)
+	var result []ipnet
+	for _, n := range nets {
+		if 32-bits32(n.mask) <= minPrefix {
+			// Already coarse enough
+			if !seen[n.ip] {
+				seen[n.ip] = true
+				result = append(result, n)
+			}
+		} else {
+			// Expand to minPrefix supernet
+			superMask := uint32(0xFFFFFFFF) << uint32(32-minPrefix)
+			superIP := n.ip & superMask
+			if !seen[superIP] {
+				seen[superIP] = true
+				result = append(result, ipnet{superIP, superMask})
+			}
+		}
+	}
+
+	// Convert back to CIDR strings and collapse
+	var cidrs []string
+	for _, n := range result {
+		bits := popcount32(n.mask)
+		cidrs = append(cidrs, fmt.Sprintf("%d.%d.%d.%d/%d",
+			byte(n.ip>>24), byte(n.ip>>16), byte(n.ip>>8), byte(n.ip), bits))
+	}
+
+	// Simple collapse: sort and merge adjacent
+	return collapseCIDRStrings(cidrs)
+}
+
+func parseIPv4(s string) uint32 {
+	ip := net.ParseIP(s)
+	if ip == nil { return 0 }
+	ip4 := ip.To4()
+	if ip4 == nil { return 0 }
+	return uint32(ip4[0])<<24 | uint32(ip4[1])<<16 | uint32(ip4[2])<<8 | uint32(ip4[3])
+}
+
+func bits32(mask uint32) int {
+	n := 0
+	for mask != 0 { n++; mask <<= 1 }
+	return n
+}
+
+func popcount32(x uint32) int {
+	n := 0
+	for x != 0 { n++; x &= x - 1 }
+	return n
+}
+
+func collapseCIDRStrings(cidrs []string) []string {
+	nets := make([]net.IPNet, 0, len(cidrs))
+	for _, c := range cidrs {
+		_, n, err := net.ParseCIDR(c)
+		if err == nil { nets = append(nets, *n) }
+	}
+	// Deduplicate
+	seen := make(map[string]bool)
+	var unique []string
+	for _, n := range nets {
+		s := n.String()
+		if !seen[s] {
+			seen[s] = true
+			unique = append(unique, s)
+		}
+	}
+	return unique
+}
+
+// aggregateRoutes merges small CIDR blocks into supernets
+// minPrefix: 24=exact(3912), 20=~2500, 18=~1800, 16=~1200
+func aggregateRoutes(routes []string, minPrefix int) []string {
+	if minPrefix <= 0 || minPrefix >= 24 {
+		return routes
+	}
+
+	seen := make(map[string]bool)
+	var result []string
+
+	superMaskBits := minPrefix
+	for _, cidr := range routes {
+		_, ipnet, err := net.ParseCIDR(cidr)
+		if err != nil {
+			continue
+		}
+		ones, _ := ipnet.Mask.Size()
+
+		if ones <= superMaskBits {
+			// Already coarse enough, keep as-is
+			key := ipnet.String()
+			if !seen[key] {
+				seen[key] = true
+				result = append(result, cidr)
+			}
+		} else {
+			// Expand to supernet
+			superMask := net.CIDRMask(superMaskBits, 32)
+			superIP := make(net.IP, 4)
+			ip4 := ipnet.IP.To4()
+			for i := 0; i < 4; i++ {
+				superIP[i] = ip4[i] & superMask[i]
+			}
+			key := fmt.Sprintf("%s/%d", superIP.String(), superMaskBits)
+			if !seen[key] {
+				seen[key] = true
+				result = append(result, key)
+			}
+		}
+	}
+
+	log.Printf("CN routes aggregated: %d → %d (/%d)", len(routes), len(result), minPrefix)
+	return result
+}
