@@ -356,6 +356,12 @@ func initUpstream() {
 		}
 	}
 	if cfg.BypassCNMode != "" {
+		// Build smart routes (for 'smart' bypass mode)
+		if err := buildSmartRoutes(cfg.CNCache); err != nil {
+			log.Printf("Smart routes: %v", err)
+		} else {
+			startSmartRoutesRefresh(cfg.CNCache)
+		}
 		if err := loadCNRoutes(cfg.CNCache); err != nil {
 			log.Printf("CN routes: %v (bypass_cn disabled)", err)
 			cfg.BypassCNMode = ""
@@ -633,11 +639,13 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 	}
 	// CN IP bypass
 	if sess.Group != nil && sess.Group.BypassCN != "" {
-		bypassMode := sess.Group.BypassCN
-		if bypassMode == "include" {
-			// Include mode: replace Split-Include with non-CN routes
+		switch sess.Group.BypassCN {
+		case "smart":
+			// Smart mode: <200 routes, all platforms (recommended)
+			resp.WriteString(getSmartIncludeHeaders())
+		case "include":
 			resp.WriteString(getCNHeaders("include"))
-		} else {
+		case "exclude":
 			resp.WriteString(getCNHeaders("exclude"))
 		}
 	}
