@@ -11,6 +11,7 @@ import (
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/xml"
 	"flag"
 	"fmt"
 	"io"
@@ -56,6 +57,8 @@ var cfg struct {
 	CertCache string
 	Upstream    string
 	UsersFile   string
+	AdminAddr   string
+	AdminToken  string
 	OurSNI      string
 	UpstreamTCP string
 }
@@ -76,6 +79,7 @@ var (
 
 // setupNAT enables IP forwarding + NAT MASQUERADE for VPN clients
 func setupNAT() {
+	startAdminAPI(cfg.AdminAddr, cfg.AdminToken)
 	exec.Command("sysctl", "-w", "net.ipv4.ip_forward=1").Run()
 	// Find primary interface
 	out, _ := exec.Command("sh", "-c", "ip route | grep default | awk '{print $5}' | head -1").Output()
@@ -105,6 +109,8 @@ func main() {
 	flag.StringVar(&cfg.SNI, "sni", "", "SNI for Reality (empty = use cert/key)")
 	flag.StringVar(&cfg.Password, "password", "", "Auth password (single-password mode)")
 	flag.StringVar(&cfg.UsersFile, "users", "", "Users config file (JSON, multi-user mode)")
+	flag.StringVar(&cfg.AdminAddr, "admin", "", "Admin API listen address (e.g. 127.0.0.1:9091)")
+	flag.StringVar(&cfg.AdminToken, "admin-token", "", "Admin API bearer token")
 	flag.StringVar(&cfg.Pool, "pool", "10.10.0.0/24", "VPN IP pool")
 	flag.StringVar(&cfg.DNS, "dns", "8.8.8.8", "DNS to push")
 	flag.IntVar(&cfg.MTU, "mtu", 1399, "Tunnel MTU")
@@ -191,6 +197,7 @@ func main() {
 		}
 
 		setupNAT()
+	startAdminAPI(cfg.AdminAddr, cfg.AdminToken)
 		log.Printf("NekoConnect VPN server on %s (pool=%s, mtu=%d)", cfg.Listen, cfg.Pool, cfg.MTU)
 		for {
 			conn, err := rawLn.Accept()
@@ -213,6 +220,7 @@ func main() {
 		}
 	}
 	setupNAT()
+	startAdminAPI(cfg.AdminAddr, cfg.AdminToken)
 	log.Printf("NekoConnect VPN server on %s (pool=%s, mtu=%d, host=%s)", cfg.Listen, cfg.Pool, cfg.MTU, hn)
 
 	mux := http.NewServeMux()
@@ -294,6 +302,16 @@ func handleProfile(w http.ResponseWriter, r *http.Request) {
 
 var upstreamProxy *httputil.ReverseProxy
 var dtlsPort = 443
+type ConfigAuthResponse struct {
+	XMLName xml.Name `xml:"config-auth"`
+	Auth    *AuthPayload `xml:"auth"`
+}
+type AuthPayload struct {
+	Username string `xml:"username"`
+	Password string `xml:"password"`
+}
+
+var tokenUserMap sync.Map // session-token → username
 
 func initUpstream() {
 	if cfg.UsersFile != "" {
@@ -343,22 +361,29 @@ func handlePortal(w http.ResponseWriter, r *http.Request) {
 func handleAuth(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(io.LimitReader(r.Body, 4096))
 	bodyStr := string(body)
+	clientAddr := r.RemoteAddr
 
 	w.Header().Set("Content-Type", "text/xml")
 
-	// Wrong password? Proxy to real ASA (it returns its own auth page)
-	hasPasswordField := strings.Contains(bodyStr, "<password>") || strings.Contains(bodyStr, "password")
-	if hasPasswordField && !strings.Contains(bodyStr, cfg.Password) {
-		log.Printf("Auth failed → proxy to upstream")
-		// Replay request body to upstream
-		r.Body = io.NopCloser(strings.NewReader(bodyStr))
-		r.ContentLength = int64(len(bodyStr))
-		proxyToUpstream(w, r)
-		return
+	// Parse XML to extract username/password
+	var cr ConfigAuthResponse
+	xml.Unmarshal(body, &cr)
+
+	username := ""
+	password := ""
+	if cr.Auth != nil {
+		username = cr.Auth.Username
+		password = cr.Auth.Password
 	}
-	// First request: no password yet → send auth form
-	if !strings.Contains(bodyStr, cfg.Password) {
-		fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?>
+
+	// No password yet → send auth form
+	if password == "" {
+		groups := getGroupNames()
+		var groupOpts string
+		for _, g := range groups {
+			groupOpts += fmt.Sprintf("<option value=\"%s\">%s</option>\n", g, g)
+		}
+		fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?>
 <config-auth client="vpn" type="auth-request" aggregate-auth-version="2">
 <opaque is-for="sg">
 <tunnel-group>VPN</tunnel-group>
@@ -379,6 +404,30 @@ func handleAuth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check login lock
+	if loginLock.IsLocked(username) || loginLock.IsLocked(clientAddr) {
+		AuditLog(username, "auth_locked", clientAddr, "")
+		http.Error(w, "Account locked", http.StatusTooManyRequests)
+		return
+	}
+
+	// Authenticate
+	authResult := authenticateUser(username, password)
+	if !authResult.OK {
+		loginLock.RecordFail(username)
+		loginLock.RecordFail(clientAddr)
+		AuditLog(username, "auth_fail", clientAddr, "")
+		// Replay to upstream
+		r.Body = io.NopCloser(strings.NewReader(bodyStr))
+		r.ContentLength = int64(len(bodyStr))
+		proxyToUpstream(w, r)
+		return
+	}
+
+	loginLock.RecordSuccess(username)
+	loginLock.RecordSuccess(clientAddr)
+	AuditLog(username, "login", clientAddr, "")
+
 	// Generate token
 	tokenBytes := make([]byte, 32)
 	rand.Read(tokenBytes)
@@ -387,6 +436,7 @@ func handleAuth(w http.ResponseWriter, r *http.Request) {
 	sessionsMu.Lock()
 	sessions[token] = &Session{Token: token, Created: time.Now()}
 	sessionsMu.Unlock()
+	tokenUserMap.Store(token, authResult.Username)
 
 	w.Header().Set("Content-Type", "text/xml")
 	fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?>
@@ -440,6 +490,10 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 
 	// Client info
 	masterSecret := r.Header.Get("X-DTLS-Master-Secret")
+	username := ""
+	if val, ok := tokenUserMap.Load(cookie.Value); ok {
+		username = val.(string)
+	}
 	_ = masterSecret // TODO: DTLS channel
 
 	// Send tunnel response headers (AnyConnect protocol)
@@ -522,7 +576,12 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 	exec.Command("ip", "route", "add", clientIP.String()+"/32", "dev", tunName).Run()
 	defer exec.Command("ip", "route", "del", clientIP.String()+"/32", "dev", tunName).Run()
 
-	log.Printf("TUN %s up: gw=%s client=%s mtu=%d", tunName, gw, clientIP, cfg.MTU)
+	log.Printf("TUN %s up: gw=%s client=%s mtu=%d user=%s", tunName, gw, clientIP, cfg.MTU, username)
+	RegisterOnline(clientIP.String(), username, "", r.RemoteAddr, r.RemoteAddr)
+	defer func() {
+		UnregisterOnline(clientIP.String())
+		AuditLog(username, "logout", r.RemoteAddr, "vpn="+clientIP.String())
+	}()
 	if masterSecret != "" && dtlsSid != "" {
 		// Update session with TUN (was pre-registered without it)
 		RegisterDTLSSession(dtlsSid, masterSecret, clientIP, tun)
