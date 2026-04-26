@@ -19,8 +19,9 @@ import (
 const chnroutesURL = "https://raw.githubusercontent.com/misakaio/chnroutes2/master/chnroutes.txt"
 
 var (
-	cnRoutes   []string // CIDR format
-	cnRoutesMu sync.RWMutex
+	cnRoutes    []string // CN CIDR (for exclude mode)
+	nonCNRoutes []string // non-CN CIDR (for include mode)
+	cnRoutesMu  sync.RWMutex
 )
 
 func loadCNRoutes(cacheFile string) error {
@@ -59,6 +60,7 @@ func loadCNRoutes(cacheFile string) error {
 	cnRoutesMu.Unlock()
 
 	log.Printf("Loaded %d CN routes", len(routes))
+	invertCNRoutes()
 
 	// Save to cache
 	if cacheFile != "" {
@@ -85,6 +87,7 @@ func loadCNRoutesFromFile(path string) error {
 	cnRoutesMu.Unlock()
 
 	log.Printf("Loaded %d CN routes from cache %s", len(routes), path)
+	invertCNRoutes()
 	return nil
 }
 
@@ -120,14 +123,21 @@ func saveCNRoutesCache(path string, routes []string) {
 	}
 }
 
-// getCNExcludeHeaders returns X-CSTP-Split-Exclude headers for all CN IPs
-func getCNExcludeHeaders() string {
+// getCNHeaders returns Split-Exclude or Split-Include headers based on mode
+func getCNHeaders(mode string) string {
 	cnRoutesMu.RLock()
 	defer cnRoutesMu.RUnlock()
 
 	var sb strings.Builder
-	for _, cidr := range cnRoutes {
-		sb.WriteString(fmt.Sprintf("X-CSTP-Split-Exclude: %s\r\n", cidrToMask(cidr)))
+	switch mode {
+	case "exclude":
+		for _, cidr := range cnRoutes {
+			sb.WriteString(fmt.Sprintf("X-CSTP-Split-Exclude: %s\r\n", cidrToMask(cidr)))
+		}
+	case "include":
+		for _, cidr := range nonCNRoutes {
+			sb.WriteString(fmt.Sprintf("X-CSTP-Split-Include: %s\r\n", cidrToMask(cidr)))
+		}
 	}
 	return sb.String()
 }
@@ -142,4 +152,80 @@ func startCNRoutesRefresh(cacheFile string) {
 			}
 		}
 	}()
+}
+
+// invertCNRoutes computes non-CN IP ranges from CN ranges
+func invertCNRoutes() {
+	cnRoutesMu.RLock()
+	routes := make([]string, len(cnRoutes))
+	copy(routes, cnRoutes)
+	cnRoutesMu.RUnlock()
+
+	// Parse CN networks
+	type ipRange struct{ start, end uint32 }
+	var ranges []ipRange
+	for _, cidr := range routes {
+		_, ipnet, err := net.ParseCIDR(cidr)
+		if err != nil { continue }
+		ip4 := ipnet.IP.To4()
+		if ip4 == nil { continue }
+		start := uint32(ip4[0])<<24 | uint32(ip4[1])<<16 | uint32(ip4[2])<<8 | uint32(ip4[3])
+		mask := uint32(ipnet.Mask[0])<<24 | uint32(ipnet.Mask[1])<<16 | uint32(ipnet.Mask[2])<<8 | uint32(ipnet.Mask[3])
+		end := start | ^mask
+		ranges = append(ranges, ipRange{start, end})
+	}
+
+	// Sort by start
+	for i := 0; i < len(ranges); i++ {
+		for j := i + 1; j < len(ranges); j++ {
+			if ranges[j].start < ranges[i].start {
+				ranges[i], ranges[j] = ranges[j], ranges[i]
+			}
+		}
+	}
+
+	// Generate non-CN ranges (gaps between CN ranges)
+	var nonCN []string
+	var cursor uint32 = 0
+	for _, r := range ranges {
+		if r.start > cursor {
+			nonCN = append(nonCN, rangeToList(cursor, r.start-1)...)
+		}
+		if r.end >= cursor {
+			cursor = r.end + 1
+		}
+	}
+	// Remaining after last CN range (up to 223.255.255.255, skip multicast)
+	if cursor <= 0xDFFFFFFF {
+		nonCN = append(nonCN, rangeToList(cursor, 0xDFFFFFFF)...)
+	}
+
+	cnRoutesMu.Lock()
+	nonCNRoutes = nonCN
+	cnRoutesMu.Unlock()
+	log.Printf("Generated %d non-CN routes (include mode)", len(nonCN))
+}
+
+// rangeToList converts an IP range to minimal CIDR list
+func rangeToList(start, end uint32) []string {
+	var result []string
+	for start <= end {
+		// Find largest block starting at 'start' that fits in [start, end]
+		maxBits := 32
+		for bits := 1; bits <= 32; bits++ {
+			mask := uint32(0xFFFFFFFF) << uint32(bits)
+			if (start & mask) != start { break }
+			blockEnd := start | ^mask
+			if blockEnd <= end {
+				maxBits = bits
+			}
+		}
+		prefix := 32 - maxBits
+		result = append(result, fmt.Sprintf("%d.%d.%d.%d/%d",
+			byte(start>>24), byte(start>>16), byte(start>>8), byte(start), prefix))
+		blockSize := uint32(1) << uint32(maxBits)
+		if start+blockSize < start { break } // overflow
+		start += blockSize
+	}
+	return result
 }

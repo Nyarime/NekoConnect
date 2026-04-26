@@ -62,7 +62,7 @@ var cfg struct {
 	AdminToken  string
 	OAuthFile   string
 	DBFile      string
-	BypassCN    bool
+	BypassCNMode string
 	CNCache     string
 	OurSNI      string
 	UpstreamTCP string
@@ -122,7 +122,7 @@ func main() {
 	flag.StringVar(&cfg.AdminToken, "admin-token", "", "Admin API bearer token")
 	flag.StringVar(&cfg.OAuthFile, "oauth", "", "OAuth/OIDC config file (JSON)")
 	flag.StringVar(&cfg.DBFile, "db", "", "SQLite database file (enables DB mode)")
-	flag.BoolVar(&cfg.BypassCN, "bypass-cn", false, "Exclude CN IPs from VPN (global)")
+	flag.StringVar(&cfg.BypassCNMode, "bypass-cn", "", "CN bypass mode: exclude or include")
 	flag.StringVar(&cfg.CNCache, "cn-cache", "/tmp/chnroutes.txt", "CN routes cache file")
 	flag.StringVar(&cfg.Pool, "pool", "10.10.0.0/24", "VPN IP pool")
 	flag.StringVar(&cfg.DNS, "dns", "8.8.8.8", "DNS to push")
@@ -353,10 +353,10 @@ func initUpstream() {
 			log.Fatal("load users:", err)
 		}
 	}
-	if cfg.BypassCN {
+	if cfg.BypassCNMode != "" {
 		if err := loadCNRoutes(cfg.CNCache); err != nil {
 			log.Printf("CN routes: %v (bypass_cn disabled)", err)
-			cfg.BypassCN = false
+			cfg.BypassCNMode = ""
 		} else {
 			startCNRoutesRefresh(cfg.CNCache)
 		}
@@ -624,13 +624,15 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 	for _, route := range groupRoutes {
 		resp.WriteString(fmt.Sprintf("X-CSTP-Split-Include: %s\r\n", cidrToMask(route)))
 	}
-	// CN IP bypass: only if group has bypass_cn enabled
-	bypassCN := false
-	if sess.Group != nil && sess.Group.BypassCN {
-		bypassCN = true
-	}
-	if bypassCN {
-		resp.WriteString(getCNExcludeHeaders())
+	// CN IP bypass
+	if sess.Group != nil && sess.Group.BypassCN != "" {
+		bypassMode := sess.Group.BypassCN
+		if bypassMode == "include" {
+			// Include mode: replace Split-Include with non-CN routes
+			resp.WriteString(getCNHeaders("include"))
+		} else {
+			resp.WriteString(getCNHeaders("exclude"))
+		}
 	}
 	dtlsSid := ""
 	if masterSecret != "" {
