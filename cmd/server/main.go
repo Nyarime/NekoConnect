@@ -68,6 +68,7 @@ var cfg struct {
 
 // Session
 type Session struct {
+	Group    *GroupConfig
 	Token    string
 	Username string
 	IP       net.IP
@@ -473,7 +474,7 @@ func handleAuth(w http.ResponseWriter, r *http.Request) {
 	token := hex.EncodeToString(tokenBytes)
 
 	sessionsMu.Lock()
-	sessions[token] = &Session{Token: token, Created: time.Now()}
+	sessions[token] = &Session{Token: token, Created: time.Now(), Group: authResult.Group}
 	sessionsMu.Unlock()
 	tokenUserMap.Store(token, authResult.Username)
 
@@ -499,6 +500,16 @@ func handleAuth(w http.ResponseWriter, r *http.Request) {
 </vpn-profile-manifest>
 </config>
 </config-auth>`, token, vpnProfileSHA1())
+}
+
+
+// cidrToMask converts "10.0.0.0/8" to "10.0.0.0/255.0.0.0" for AnyConnect
+func cidrToMask(cidr string) string {
+	_, ipnet, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return cidr
+	}
+	return fmt.Sprintf("%s/%s", ipnet.IP.String(), net.IP(ipnet.Mask).String())
 }
 
 // handleTunnel handles CONNECT /CSCOSSLC/tunnel — the actual VPN tunnel
@@ -572,7 +583,20 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 	resp.WriteString("X-CSTP-Server-Name: vpn2fa.hku.hk\r\n")
 	resp.WriteString(fmt.Sprintf("X-CSTP-Address: %s\r\n", clientIP.String()))
 	resp.WriteString(fmt.Sprintf("X-CSTP-Netmask: %s\r\n", net.IP(ipPool.Mask()).String()))
-	resp.WriteString(fmt.Sprintf("X-CSTP-DNS: %s\r\n", cfg.DNS))
+	// DNS from group config or default
+	groupDNS := cfg.DNS
+	groupRoutes := []string{cfg.Pool}
+	if val, ok := tokenUserMap.Load(cookie.Value); ok {
+		un := val.(string)
+		ar := authenticateUser(un, "") // won't match password, but we need group
+		_ = ar // lookup below
+	}
+	// Lookup group from session
+	if sess.Group != nil {
+		if sess.Group.DNS != "" { groupDNS = sess.Group.DNS }
+		if len(sess.Group.Routes) > 0 { groupRoutes = sess.Group.Routes }
+	}
+	resp.WriteString(fmt.Sprintf("X-CSTP-DNS: %s\r\n", groupDNS))
 	resp.WriteString(fmt.Sprintf("X-CSTP-MTU: %d\r\n", cfg.MTU))
 	resp.WriteString("X-CSTP-DPD: 30\r\n")
 	resp.WriteString("X-CSTP-Keepalive: 20\r\n")
@@ -585,7 +609,9 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 	resp.WriteString("X-CSTP-Rekey-Time: 86400\r\n")
 	resp.WriteString("X-CSTP-Rekey-Method: new-tunnel\r\n")
 	resp.WriteString("X-DTLS-Rekey-Time: 86400\r\n")
-	resp.WriteString("X-CSTP-Split-Include: 10.99.0.0/255.255.255.0\r\n")
+	for _, route := range groupRoutes {
+		resp.WriteString(fmt.Sprintf("X-CSTP-Split-Include: %s\r\n", cidrToMask(route)))
+	}
 	dtlsSid := ""
 	if masterSecret != "" {
 		dtlsSid = RandomHex(32)
